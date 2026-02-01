@@ -1,0 +1,712 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Connect Queue and Quick Connect Provisioning System.
+  Automatically provisions queues and quick connects from CSV files uploaded to S3.
+  Default Stack Name: connect-queue-provisioning
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Amazon Connect Configuration"
+        Parameters:
+          - ConnectInstanceId
+          - ConnectInstanceArn
+          - HoursOfOperationId
+          - TransferContactFlowId
+      - Label:
+          default: "Environment Settings"
+        Parameters:
+          - Environment
+          - LogRetentionDays
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ConnectInstanceId:
+    Type: String
+    Description: Amazon Connect Instance ID
+    Default: '9b50ddcc-8510-441e-a9c8-96e9e9281105'
+
+  ConnectInstanceArn:
+    Type: String
+    Description: Amazon Connect Instance ARN
+    Default: 'arn:aws:connect:us-east-1:551642657889:instance/9b50ddcc-8510-441e-a9c8-96e9e9281105'
+
+  HoursOfOperationId:
+    Type: String
+    Description: Hours of Operation ID for queue creation
+    Default: '0701af49-c81b-4516-ad6d-86940e98a66a'
+
+  Environment:
+    Type: String
+    Description: Deployment environment
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  LogRetentionDays:
+    Type: Number
+    Description: CloudWatch Logs retention period in days
+    Default: 30
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB Table
+  # ---------------------------------------------------------------------------
+  QueueMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'connect-queue-metadata-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: QueueName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: QueueName
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # IAM Role for Provisioning Lambda
+  # ---------------------------------------------------------------------------
+  ProvisioningLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'connect-provisioning-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::connect-queue-provisioning-${AWS::AccountId}-${Environment}/*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt QueueMetadataTable.Arn
+        - PolicyName: ConnectAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:CreateQueue
+                  - connect:CreateQuickConnect
+                  - connect:ListQueues
+                  - connect:ListQuickConnects
+                  - connect:ListContactFlows
+                  - connect:AssociateQueueQuickConnects
+                Resource:
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*'
+
+  # ---------------------------------------------------------------------------
+  # Provisioning Lambda Function
+  # ---------------------------------------------------------------------------
+  ProvisioningLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'connect-queue-provisioning-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt ProvisioningLambdaRole.Arn
+      Environment:
+        Variables:
+          CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
+          HOURS_OF_OPERATION_ID: !Ref HoursOfOperationId
+          TRANSFER_FLOW_NAME: !Sub 'Queue Transfer Flow - ${Environment}'
+          DYNAMODB_TABLE_NAME: !Ref QueueMetadataTable
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          import logging
+          import os
+          import re
+          import time
+          from datetime import datetime, timezone
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.ERROR)
+
+          CONNECT_INSTANCE_ID = os.environ['CONNECT_INSTANCE_ID']
+          HOURS_OF_OPERATION_ID = os.environ['HOURS_OF_OPERATION_ID']
+          TRANSFER_FLOW_NAME = os.environ['TRANSFER_FLOW_NAME']
+          DYNAMODB_TABLE_NAME = os.environ['DYNAMODB_TABLE_NAME']
+
+          s3 = boto3.client('s3')
+          connect = boto3.client('connect')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+
+          # Cache for transfer flow ID
+          _transfer_flow_id = None
+
+
+          def get_transfer_flow_id():
+              global _transfer_flow_id
+              if _transfer_flow_id:
+                  return _transfer_flow_id
+              
+              try:
+                  paginator = connect.get_paginator('list_contact_flows')
+                  for page in paginator.paginate(InstanceId=CONNECT_INSTANCE_ID, ContactFlowTypes=['QUEUE_TRANSFER']):
+                      for flow in page.get('ContactFlowSummaryList', []):
+                          if flow['Name'] == TRANSFER_FLOW_NAME:
+                              _transfer_flow_id = flow['Id']
+                              return _transfer_flow_id
+              except ClientError as e:
+                  logger.error(f"Failed to get transfer flow: {e}")
+              
+              raise ValueError(f"Transfer flow '{TRANSFER_FLOW_NAME}' not found")
+
+
+          def lambda_handler(event, context):
+              results = {'processed': 0, 'success': 0, 'failed': 0}
+              
+              try:
+                  existing_queues = get_existing_queues()
+                  transfer_flow_id = get_transfer_flow_id()
+                  
+                  for record in event.get('Records', []):
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      content = response['Body'].read().decode('utf-8')
+                      reader = csv.DictReader(io.StringIO(content))
+                      rows = list(reader)
+                      
+                      # Phase 1: Create all queues
+                      queue_data = []
+                      for row in rows:
+                          results['processed'] += 1
+                          try:
+                              queue_name = row['QueueName'].strip()
+                              phone = row.get('PhoneNumber', '').strip()
+                              assoc_queue = row.get('AssociateToQueue', '').strip()
+                              
+                              queue_id = create_queue(queue_name, existing_queues)
+                              if queue_id:
+                                  queue_data.append({
+                                      'name': queue_name,
+                                      'id': queue_id,
+                                      'phone': phone,
+                                      'assoc': assoc_queue
+                                  })
+                          except Exception as e:
+                              results['failed'] += 1
+                              logger.error(f"Queue error: {e}")
+                      
+                      # Wait for propagation
+                      if queue_data:
+                          time.sleep(5)
+                          existing_queues = get_existing_queues()
+                      
+                      # Phase 2: Create quick connects
+                      for data in queue_data:
+                          try:
+                              qc_id = create_quick_connect(data['name'], data['id'], transfer_flow_id)
+                              if qc_id and data['assoc']:
+                                  associate_qc(qc_id, data['assoc'], existing_queues)
+                              
+                              save_to_db(data['name'], data['id'], qc_id, data['phone'], data['assoc'])
+                              results['success'] += 1
+                          except Exception as e:
+                              results['failed'] += 1
+                              logger.error(f"QC error: {e}")
+                  
+                  return results
+              except Exception as e:
+                  logger.error(f"Fatal: {e}")
+                  raise
+
+
+          def get_existing_queues():
+              queues = {}
+              paginator = connect.get_paginator('list_queues')
+              for page in paginator.paginate(InstanceId=CONNECT_INSTANCE_ID, QueueTypes=['STANDARD']):
+                  for q in page.get('QueueSummaryList', []):
+                      queues[q['Name']] = q['Id']
+              return queues
+
+
+          def create_queue(name, existing):
+              if name in existing:
+                  return existing[name]
+              try:
+                  resp = connect.create_queue(
+                      InstanceId=CONNECT_INSTANCE_ID,
+                      Name=name,
+                      Description=f"Queue for {name}",
+                      HoursOfOperationId=HOURS_OF_OPERATION_ID
+                  )
+                  existing[name] = resp['QueueId']
+                  return resp['QueueId']
+              except connect.exceptions.DuplicateResourceException:
+                  for q in get_existing_queues().items():
+                      if q[0] == name:
+                          return q[1]
+              except ClientError as e:
+                  logger.error(f"Create queue error: {e}")
+              return None
+
+
+          def create_quick_connect(name, queue_id, transfer_flow_id):
+              try:
+                  resp = connect.create_quick_connect(
+                      InstanceId=CONNECT_INSTANCE_ID,
+                      Name=name,
+                      Description=f"QC for {name}",
+                      QuickConnectConfig={
+                          'QuickConnectType': 'QUEUE',
+                          'QueueConfig': {
+                              'QueueId': queue_id,
+                              'ContactFlowId': transfer_flow_id
+                          }
+                      }
+                  )
+                  return resp['QuickConnectId']
+              except connect.exceptions.DuplicateResourceException:
+                  paginator = connect.get_paginator('list_quick_connects')
+                  for page in paginator.paginate(InstanceId=CONNECT_INSTANCE_ID, QuickConnectTypes=['QUEUE']):
+                      for qc in page.get('QuickConnectSummaryList', []):
+                          if qc['Name'] == name:
+                              return qc['Id']
+              except ClientError as e:
+                  logger.error(f"Create QC error: {e}")
+              return None
+
+
+          def associate_qc(qc_id, target_name, existing):
+              target_id = existing.get(target_name)
+              if not target_id:
+                  logger.error(f"Target queue not found: {target_name}")
+                  return
+              try:
+                  connect.associate_queue_quick_connects(
+                      InstanceId=CONNECT_INSTANCE_ID,
+                      QueueId=target_id,
+                      QuickConnectIds=[qc_id]
+                  )
+              except ClientError as e:
+                  logger.error(f"Associate error: {e}")
+
+
+          def save_to_db(name, queue_id, qc_id, phone, assoc):
+              phone_e164 = None
+              if phone:
+                  cleaned = re.sub(r'[^\d+]', '', phone)
+                  if cleaned.startswith('+'):
+                      phone_e164 = cleaned
+                  elif len(cleaned) == 10:
+                      phone_e164 = f"+1{cleaned}"
+                  elif len(cleaned) == 11 and cleaned.startswith('1'):
+                      phone_e164 = f"+{cleaned}"
+              
+              item = {
+                  'QueueName': name,
+                  'QueueId': queue_id,
+                  'QuickConnectName': name,
+                  'AssociatedQueueName': assoc,
+                  'CreatedAt': datetime.now(timezone.utc).isoformat()
+              }
+              if qc_id:
+                  item['QuickConnectId'] = qc_id
+              if phone_e164:
+                  item['PhoneNumberE164'] = phone_e164
+              
+              table.put_item(Item=item)
+
+  # ---------------------------------------------------------------------------
+  # Lambda Permission for S3
+  # ---------------------------------------------------------------------------
+  LambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProvisioningLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::connect-queue-provisioning-${AWS::AccountId}-${Environment}'
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket with Notification
+  # ---------------------------------------------------------------------------
+  ProvisioningBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaS3Permission
+    Properties:
+      BucketName: !Sub 'connect-queue-provisioning-${AWS::AccountId}-${Environment}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt ProvisioningLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: '.csv'
+                  - Name: prefix
+                    Value: 'uploads/'
+
+  # ---------------------------------------------------------------------------
+  # Create uploads/ folder in S3
+  # ---------------------------------------------------------------------------
+  S3FolderCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PutObject
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${ProvisioningBucket.Arn}/*'
+
+  S3FolderCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'connect-s3-folder-creator-${Environment}'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt S3FolderCreatorRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              if event['RequestType'] in ['Create', 'Update']:
+                  try:
+                      bucket = event['ResourceProperties']['Bucket']
+                      folder = event['ResourceProperties']['Folder']
+                      boto3.client('s3').put_object(Bucket=bucket, Key=folder)
+                  except Exception as e:
+                      print(f"Error: {e}")
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  CreateUploadsFolder:
+    Type: Custom::S3Folder
+    DependsOn: ProvisioningBucket
+    Properties:
+      ServiceToken: !GetAtt S3FolderCreatorFunction.Arn
+      Bucket: !Ref ProvisioningBucket
+      Folder: 'uploads/'
+
+  # ---------------------------------------------------------------------------
+  # Query Lambda Role
+  # ---------------------------------------------------------------------------
+  QueryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'connect-query-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource: !GetAtt QueueMetadataTable.Arn
+
+  # ---------------------------------------------------------------------------
+  # Query Lambda Function
+  # ---------------------------------------------------------------------------
+  QueryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'connect-queue-query-${Environment}'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt QueryLambdaRole.Arn
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref QueueMetadataTable
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+          import re
+          from boto3.dynamodb.conditions import Attr
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.ERROR)
+
+          table = boto3.resource('dynamodb').Table(os.environ['DYNAMODB_TABLE_NAME'])
+
+
+          def lambda_handler(event, context):
+              try:
+                  if 'Details' in event:
+                      params = event['Details'].get('Parameters', {})
+                      op = params.get('Operation', 'get_queue')
+                  else:
+                      params = event
+                      op = event.get('operation', 'get_queue')
+                  
+                  if op == 'get_queue':
+                      name = params.get('QueueName') or params.get('queue_name')
+                      if not name:
+                          return {'Found': 'false', 'Error': 'QueueName required'}
+                      resp = table.get_item(Key={'QueueName': name})
+                      if 'Item' not in resp:
+                          return {'Found': 'false'}
+                      item = resp['Item']
+                      return {
+                          'Found': 'true',
+                          'QueueName': item.get('QueueName', ''),
+                          'QueueId': item.get('QueueId', ''),
+                          'QuickConnectName': item.get('QuickConnectName', ''),
+                          'QuickConnectId': item.get('QuickConnectId', ''),
+                          'PhoneNumber': item.get('PhoneNumberE164', ''),
+                          'AssociatedQueueName': item.get('AssociatedQueueName', '')
+                      }
+                  
+                  elif op == 'list_queues':
+                      limit = int(params.get('limit', 100))
+                      resp = table.scan(Limit=limit)
+                      queues = [{'QueueName': i.get('QueueName'), 'QueueId': i.get('QueueId')} for i in resp.get('Items', [])]
+                      return {'Count': str(len(queues)), 'Queues': json.dumps(queues)}
+                  
+                  elif op == 'search_by_phone':
+                      phone = params.get('PhoneNumber') or params.get('phone_number')
+                      if not phone:
+                          return {'Found': 'false', 'Error': 'PhoneNumber required'}
+                      normalized = re.sub(r'[^\d+]', '', phone)
+                      if not normalized.startswith('+'):
+                          normalized = f"+{normalized}"
+                      resp = table.scan(FilterExpression=Attr('PhoneNumberE164').eq(normalized), Limit=1)
+                      items = resp.get('Items', [])
+                      if not items:
+                          return {'Found': 'false'}
+                      item = items[0]
+                      return {
+                          'Found': 'true',
+                          'QueueName': item.get('QueueName', ''),
+                          'QueueId': item.get('QueueId', ''),
+                          'PhoneNumber': item.get('PhoneNumberE164', '')
+                      }
+                  
+                  return {'Found': 'false', 'Error': 'Unknown operation'}
+              except Exception as e:
+                  logger.error(f"Error: {e}")
+                  return {'Found': 'false', 'Error': str(e)}
+
+  # ---------------------------------------------------------------------------
+  # Connect Lambda Permission
+  # ---------------------------------------------------------------------------
+  QueryLambdaConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QueryLambda
+      Action: lambda:InvokeFunction
+      Principal: connect.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Ref ConnectInstanceArn
+
+  # ---------------------------------------------------------------------------
+  # Connect Integration
+  # ---------------------------------------------------------------------------
+  ConnectIntegration:
+    Type: AWS::Connect::IntegrationAssociation
+    Properties:
+      InstanceId: !Ref ConnectInstanceArn
+      IntegrationType: LAMBDA_FUNCTION
+      IntegrationArn: !GetAtt QueryLambda.Arn
+
+  # ---------------------------------------------------------------------------
+  # Queue Transfer Contact Flow
+  # ---------------------------------------------------------------------------
+  QueueTransferFlow:
+    Type: AWS::Connect::ContactFlow
+    DependsOn: ConnectIntegration
+    Properties:
+      InstanceArn: !Ref ConnectInstanceArn
+      Name: !Sub 'Queue Transfer Flow - ${Environment}'
+      Description: Looks up queue phone number via Lambda and transfers the call
+      Type: QUEUE_TRANSFER
+      State: ACTIVE
+      Content: !Sub |
+        {
+          "Version": "2019-10-30",
+          "StartAction": "Logging",
+          "Metadata": {
+            "entryPointPosition": {"x": -19.2, "y": 17.6},
+            "ActionMetadata": {
+              "02b1386c-f66f-453d-850c-d18f15950695": {"position": {"x": 1036.8, "y": 330.4}},
+              "Logging": {"position": {"x": 6.4, "y": 222.4}, "isFriendlyName": true},
+              "add26202-f6ab-4b11-9ba3-c0dad0a3e65d": {
+                "position": {"x": 755.2, "y": 380.8},
+                "conditions": [],
+                "conditionMetadata": [{"id": "493aca70-7165-4cfc-9ac8-d095a7d7a840", "operator": {"name": "Equals", "value": "Equals", "shortDisplay": "="}, "value": "true"}]
+              },
+              "583f8533-e6aa-46a4-b2c8-c453f5bdab52": {
+                "position": {"x": 961.6, "y": 78.4},
+                "parameters": {"ThirdPartyPhoneNumber": {"countryCode": "", "useDynamic": true}}
+              },
+              "LambdaFunctionAttribute": {"position": {"x": 197.6, "y": 25.6}, "isFriendlyName": true},
+              "Get phone number": {
+                "position": {"x": 472, "y": 269.6},
+                "isFriendlyName": true,
+                "parameters": {"LambdaFunctionARN": {"useDynamic": true}, "LambdaInvocationAttributes": {"QueueName": {"useDynamic": true}}},
+                "dynamicMetadata": {"Operation": false, "QueueName": true},
+                "useDynamic": true
+              },
+              "f4f1be92-bab5-4107-903e-d730a455417f": {"position": {"x": 758.4, "y": -92.8}}
+            },
+            "Annotations": [],
+            "name": "Queue Transfer Flow - ${Environment}",
+            "description": "Looks up queue phone number via Lambda and transfers the call",
+            "type": "queueTransfer",
+            "status": "published",
+            "hash": {}
+          },
+          "Actions": [
+            {
+              "Parameters": {},
+              "Identifier": "02b1386c-f66f-453d-850c-d18f15950695",
+              "Type": "EndFlowExecution",
+              "Transitions": {}
+            },
+            {
+              "Parameters": {"FlowLoggingBehavior": "Enabled"},
+              "Identifier": "Logging",
+              "Type": "UpdateFlowLoggingBehavior",
+              "Transitions": {"NextAction": "LambdaFunctionAttribute"}
+            },
+            {
+              "Parameters": {"ComparisonValue": "$.External.Found"},
+              "Identifier": "add26202-f6ab-4b11-9ba3-c0dad0a3e65d",
+              "Type": "Compare",
+              "Transitions": {
+                "NextAction": "02b1386c-f66f-453d-850c-d18f15950695",
+                "Conditions": [{"NextAction": "583f8533-e6aa-46a4-b2c8-c453f5bdab52", "Condition": {"Operator": "Equals", "Operands": ["true"]}}],
+                "Errors": [{"NextAction": "02b1386c-f66f-453d-850c-d18f15950695", "ErrorType": "NoMatchingCondition"}]
+              }
+            },
+            {
+              "Parameters": {"ThirdPartyPhoneNumber": "$.External.PhoneNumber", "ThirdPartyConnectionTimeLimitSeconds": "30", "ContinueFlowExecution": "False"},
+              "Identifier": "583f8533-e6aa-46a4-b2c8-c453f5bdab52",
+              "Type": "TransferParticipantToThirdParty",
+              "Transitions": {
+                "NextAction": "f4f1be92-bab5-4107-903e-d730a455417f",
+                "Errors": [{"NextAction": "f4f1be92-bab5-4107-903e-d730a455417f", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Parameters": {"FlowAttributes": {"LambdaARN": {"Value": "${QueryLambda.Arn}"}}},
+              "Identifier": "LambdaFunctionAttribute",
+              "Type": "UpdateFlowAttributes",
+              "Transitions": {
+                "NextAction": "Get phone number",
+                "Errors": [{"NextAction": "f4f1be92-bab5-4107-903e-d730a455417f", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Parameters": {
+                "LambdaFunctionARN": "$.FlowAttributes.LambdaARN",
+                "InvocationTimeLimitSeconds": "3",
+                "InvocationType": "SYNCHRONOUS",
+                "LambdaInvocationAttributes": {"Operation": "get_queue", "QueueName": "$.Queue.Name"},
+                "ResponseValidation": {"ResponseType": "STRING_MAP"}
+              },
+              "Identifier": "Get phone number",
+              "Type": "InvokeLambdaFunction",
+              "Transitions": {
+                "NextAction": "add26202-f6ab-4b11-9ba3-c0dad0a3e65d",
+                "Errors": [{"NextAction": "f4f1be92-bab5-4107-903e-d730a455417f", "ErrorType": "NoMatchingError"}]
+              }
+            },
+            {
+              "Parameters": {},
+              "Identifier": "f4f1be92-bab5-4107-903e-d730a455417f",
+              "Type": "DisconnectParticipant",
+              "Transitions": {}
+            }
+          ]
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  BucketName:
+    Description: S3 bucket for CSV uploads
+    Value: !Ref ProvisioningBucket
+  
+  UploadPath:
+    Description: S3 path for uploading CSV files
+    Value: !Sub 's3://${ProvisioningBucket}/uploads/'
+  
+  DynamoDBTable:
+    Description: DynamoDB table for queue metadata
+    Value: !Ref QueueMetadataTable
+  
+  ProvisioningLambdaArn:
+    Description: ARN of the provisioning Lambda
+    Value: !GetAtt ProvisioningLambda.Arn
+  
+  QueryLambdaArn:
+    Description: ARN of the query Lambda
+    Value: !GetAtt QueryLambda.Arn
+  
+  QueueTransferFlowArn:
+    Description: ARN of the Queue Transfer contact flow
+    Value: !GetAtt QueueTransferFlow.ContactFlowArn

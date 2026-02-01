@@ -1,0 +1,7 @@
+QueueName,PhoneNumber,AssociateToQueue
+Sales,+1 (555) 123-4567,BasicQueue
+Support,(555) 987-6543,BasicQueue
+Billing,1-800-555-0100,BasicQueue
+Technical Support,5551234567,BasicQueue
+Customer Service,+44 20 7946 0958,BasicQueue
+Returns,555.321.9876,BasicQueue
