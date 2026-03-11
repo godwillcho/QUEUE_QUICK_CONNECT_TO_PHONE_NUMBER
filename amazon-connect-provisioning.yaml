@@ -81,7 +81,6 @@ Resources:
   ProvisioningLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'connect-provisioning-role-${Environment}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -233,9 +232,10 @@ Resources:
                           existing_queues = get_existing_queues()
                       
                       # Phase 2: Create quick connects
+                      existing_qcs = get_existing_quick_connects()
                       for data in queue_data:
                           try:
-                              qc_id = create_quick_connect(data['name'], data['id'], transfer_flow_id)
+                              qc_id = create_quick_connect(data['name'], data['id'], transfer_flow_id, existing_qcs)
                               if qc_id and data['assoc']:
                                   associate_qc(qc_id, data['assoc'], existing_queues)
                               
@@ -281,7 +281,18 @@ Resources:
               return None
 
 
-          def create_quick_connect(name, queue_id, transfer_flow_id):
+          def get_existing_quick_connects():
+              qcs = {}
+              paginator = connect.get_paginator('list_quick_connects')
+              for page in paginator.paginate(InstanceId=CONNECT_INSTANCE_ID, QuickConnectTypes=['QUEUE']):
+                  for qc in page.get('QuickConnectSummaryList', []):
+                      qcs[qc['Name']] = qc['Id']
+              return qcs
+
+
+          def create_quick_connect(name, queue_id, transfer_flow_id, existing_qcs):
+              if name in existing_qcs:
+                  return existing_qcs[name]
               try:
                   resp = connect.create_quick_connect(
                       InstanceId=CONNECT_INSTANCE_ID,
@@ -297,11 +308,8 @@ Resources:
                   )
                   return resp['QuickConnectId']
               except connect.exceptions.DuplicateResourceException:
-                  paginator = connect.get_paginator('list_quick_connects')
-                  for page in paginator.paginate(InstanceId=CONNECT_INSTANCE_ID, QuickConnectTypes=['QUEUE']):
-                      for qc in page.get('QuickConnectSummaryList', []):
-                          if qc['Name'] == name:
-                              return qc['Id']
+                  refreshed = get_existing_quick_connects()
+                  return refreshed.get(name)
               except ClientError as e:
                   logger.error(f"Create QC error: {e}")
               return None
@@ -439,7 +447,6 @@ Resources:
   QueryLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'connect-query-role-${Environment}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
