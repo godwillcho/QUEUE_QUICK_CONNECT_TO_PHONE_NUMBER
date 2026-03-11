@@ -18,6 +18,7 @@ Metadata:
           default: "Environment Settings"
         Parameters:
           - Environment
+          - DeployId
           - LogRetentionDays
 
 # =============================================================================
@@ -48,6 +49,13 @@ Parameters:
       - staging
       - prod
 
+  DeployId:
+    Type: String
+    Description: Short unique ID to distinguish deployments (max 10 chars, e.g. v1, v2, blue)
+    Default: v1
+    MaxLength: 10
+    AllowedPattern: '[a-z0-9]+'
+
   LogRetentionDays:
     Type: Number
     Description: CloudWatch Logs retention period in days
@@ -64,7 +72,7 @@ Resources:
   QueueMetadataTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub 'connect-queue-metadata-${Environment}'
+      TableName: !Sub 'connect-queue-metadata-${Environment}-${DeployId}'
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: QueueName
@@ -98,7 +106,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:GetObject
-                Resource: !Sub 'arn:aws:s3:::connect-queue-provisioning-${AWS::AccountId}-${Environment}/*'
+                Resource: !Sub 'arn:aws:s3:::connect-queue-provisioning-${AWS::AccountId}-${Environment}-${DeployId}/*'
         - PolicyName: DynamoDBAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -130,7 +138,7 @@ Resources:
   ProvisioningLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'connect-queue-provisioning-${Environment}'
+      FunctionName: !Sub 'connect-queue-provisioning-${Environment}-${DeployId}'
       Runtime: python3.12
       Handler: index.lambda_handler
       Timeout: 300
@@ -140,7 +148,7 @@ Resources:
         Variables:
           CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
           HOURS_OF_OPERATION_ID: !Ref HoursOfOperationId
-          TRANSFER_FLOW_NAME: !Sub 'Queue Transfer Flow - ${Environment}'
+          TRANSFER_FLOW_NAME: !Sub 'Queue Transfer Flow - ${Environment}-${DeployId}'
           DYNAMODB_TABLE_NAME: !Ref QueueMetadataTable
       Code:
         ZipFile: |
@@ -365,7 +373,7 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
-      SourceArn: !Sub 'arn:aws:s3:::connect-queue-provisioning-${AWS::AccountId}-${Environment}'
+      SourceArn: !Sub 'arn:aws:s3:::connect-queue-provisioning-${AWS::AccountId}-${Environment}-${DeployId}'
 
   # ---------------------------------------------------------------------------
   # S3 Bucket with Notification
@@ -374,7 +382,7 @@ Resources:
     Type: AWS::S3::Bucket
     DependsOn: LambdaS3Permission
     Properties:
-      BucketName: !Sub 'connect-queue-provisioning-${AWS::AccountId}-${Environment}'
+      BucketName: !Sub 'connect-queue-provisioning-${AWS::AccountId}-${Environment}-${DeployId}'
       NotificationConfiguration:
         LambdaConfigurations:
           - Event: 's3:ObjectCreated:*'
@@ -414,7 +422,7 @@ Resources:
   S3FolderCreatorFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'connect-s3-folder-creator-${Environment}'
+      FunctionName: !Sub 'connect-s3-folder-creator-${Environment}-${DeployId}'
       Runtime: python3.12
       Handler: index.handler
       Timeout: 30
@@ -473,7 +481,7 @@ Resources:
   QueryLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub 'connect-queue-query-${Environment}'
+      FunctionName: !Sub 'connect-queue-query-${Environment}-${DeployId}'
       Runtime: python3.12
       Handler: index.lambda_handler
       Timeout: 30
@@ -583,7 +591,7 @@ Resources:
     DependsOn: ConnectIntegration
     Properties:
       InstanceArn: !Ref ConnectInstanceArn
-      Name: !Sub 'Queue Transfer Flow - ${Environment}'
+      Name: !Sub 'Queue Transfer Flow - ${Environment}-${DeployId}'
       Description: Looks up queue phone number via Lambda and transfers the call
       Type: QUEUE_TRANSFER
       State: ACTIVE
@@ -616,7 +624,7 @@ Resources:
               "f4f1be92-bab5-4107-903e-d730a455417f": {"position": {"x": 758.4, "y": -92.8}}
             },
             "Annotations": [],
-            "name": "Queue Transfer Flow - ${Environment}",
+            "name": "Queue Transfer Flow - ${Environment}-${DeployId}",
             "description": "Looks up queue phone number via Lambda and transfers the call",
             "type": "queueTransfer",
             "status": "published",
