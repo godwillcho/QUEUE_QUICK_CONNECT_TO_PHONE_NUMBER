@@ -4,9 +4,13 @@ Automated provisioning of Amazon Connect queues and quick connects from CSV file
 
 ## Why Not Use Phone Quick Connects?
 
-Amazon Connect provides a built-in **Phone quick connect** type that transfers directly to an external number. However, it has a key limitation: **you cannot set a custom outbound Caller ID per transfer**. The caller ID is determined by the queue's outbound caller ID configuration and applies to all transfers from that queue — you cannot show a different number to the receiving party based on which quick connect was clicked.
+Amazon Connect provides a built-in **Phone quick connect** type that transfers directly to an external number. However, it has two key limitations that this solution addresses:
 
-This solution works around that limitation by using **Queue quick connects paired with a contact flow** instead of Phone quick connects:
+### 1. No Custom Caller ID Per Transfer
+
+With Phone quick connects, **you cannot set a custom outbound Caller ID per transfer**. The caller ID is determined by the queue's outbound caller ID configuration and applies to all transfers from that queue — you cannot show a different number to the receiving party based on which quick connect was clicked.
+
+This solution uses **Queue quick connects paired with a contact flow** instead:
 
 1. Agent clicks a Queue quick connect (e.g., "Sales")
 2. A contact flow fires and looks up the record in DynamoDB
@@ -15,8 +19,6 @@ This solution works around that limitation by using **Queue quick connects paire
 
 **Each row in the CSV has its own `CallerID` field**, so different transfers can present different whitelisted phone numbers to the receiving party. This is not achievable with native Phone quick connects.
 
-### Example
-
 | Quick Connect | Destination | Caller ID Shown |
 |---------------|-------------|-----------------|
 | Sales | +1 (555) 123-4567 | +1 (555) 000-0001 |
@@ -24,6 +26,12 @@ This solution works around that limitation by using **Queue quick connects paire
 | Billing | 1-800-555-0100 | +1 (800) 000-0003 |
 
 Each transfer shows a **different outbound number** to the person being called, even though agents are all in the same queue. The Caller ID numbers must be whitelisted (claimed) in your Amazon Connect instance.
+
+### 2. Hiding External Phone Numbers From Agents
+
+With a Phone quick connect, **the external phone number is visible to the agent** in the Contact Control Panel (CCP). This can be a problem when the business requires that agents should not know the actual destination numbers — for example, when transferring to partner organizations, external vendors, or sensitive departments where the direct number must remain confidential.
+
+Because this solution uses **Queue quick connects**, agents only see the **queue name** (e.g., "Sales", "Partner Support") in their CCP — not the underlying phone number. The phone number is stored in DynamoDB and resolved at runtime by the contact flow, completely hidden from the agent's view.
 
 ## Architecture
 
