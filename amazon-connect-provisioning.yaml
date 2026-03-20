@@ -131,10 +131,13 @@ Resources:
                 Action:
                   - connect:CreateQueue
                   - connect:CreateQuickConnect
+                  - connect:DeleteQuickConnect
+                  - connect:DescribeQuickConnect
                   - connect:ListQueues
                   - connect:ListQuickConnects
                   - connect:ListContactFlows
                   - connect:AssociateQueueQuickConnects
+                  - connect:DisassociateQueueQuickConnects
                 Resource:
                   - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
                   - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*'
@@ -381,7 +384,8 @@ Resources:
                                           flow_id = default_flow_id
 
                                   qc_id = create_quick_connect(
-                                      data['name'], target_queue_id, flow_id, existing_qcs
+                                      data['name'], target_queue_id, flow_id, existing_qcs,
+                                      data['assoc'], existing_queues
                                   )
                                   time.sleep(API_DELAY)
 
@@ -449,9 +453,50 @@ Resources:
               return qcs
 
 
-          def create_quick_connect(name, queue_id, flow_id, existing_qcs):
+          def get_qc_flow_id(qc_id):
+              try:
+                  resp = connect.describe_quick_connect(
+                      InstanceId=CONNECT_INSTANCE_ID,
+                      QuickConnectId=qc_id
+                  )
+                  config = resp['QuickConnect']['QuickConnectConfig']
+                  return config.get('QueueConfig', {}).get('ContactFlowId')
+              except ClientError as e:
+                  logger.error(f"Describe QC error: {e}")
+              return None
+
+
+          def delete_quick_connect(qc_id, assoc_queue_name, existing_queues):
+              if assoc_queue_name:
+                  target_id = existing_queues.get(assoc_queue_name)
+                  if target_id:
+                      try:
+                          connect.disassociate_queue_quick_connects(
+                              InstanceId=CONNECT_INSTANCE_ID,
+                              QueueId=target_id,
+                              QuickConnectIds=[qc_id]
+                          )
+                      except ClientError:
+                          pass
+              try:
+                  connect.delete_quick_connect(
+                      InstanceId=CONNECT_INSTANCE_ID,
+                      QuickConnectId=qc_id
+                  )
+              except ClientError as e:
+                  logger.error(f"Delete QC error: {e}")
+
+
+          def create_quick_connect(name, queue_id, flow_id, existing_qcs, assoc_queue_name='', existing_queues=None):
               if name in existing_qcs:
-                  return existing_qcs[name]
+                  existing_qc_id = existing_qcs[name]
+                  current_flow_id = get_qc_flow_id(existing_qc_id)
+                  if current_flow_id == flow_id:
+                      return existing_qc_id
+                  # Flow changed — delete and recreate
+                  delete_quick_connect(existing_qc_id, assoc_queue_name, existing_queues or {})
+                  del existing_qcs[name]
+                  time.sleep(API_DELAY)
               try:
                   resp = connect.create_quick_connect(
                       InstanceId=CONNECT_INSTANCE_ID,
@@ -465,6 +510,7 @@ Resources:
                           }
                       }
                   )
+                  existing_qcs[name] = resp['QuickConnectId']
                   return resp['QuickConnectId']
               except connect.exceptions.DuplicateResourceException:
                   refreshed = get_existing_quick_connects()
