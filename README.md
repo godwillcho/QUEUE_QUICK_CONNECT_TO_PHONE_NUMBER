@@ -21,9 +21,9 @@ This solution uses **Queue quick connects paired with a contact flow** instead:
 
 | Quick Connect | Destination | Caller ID Shown |
 |---------------|-------------|-----------------|
-| Sales | +1 (555) 123-4567 | +1 (555) 000-0001 |
-| Support | +1 (555) 987-6543 | +1 (555) 000-0002 |
-| Billing | 1-800-555-0100 | +1 (800) 000-0003 |
+| Partner Logistics | +1 (555) 123-4567 | +1 (555) 000-0001 |
+| Partner Claims | +1 (555) 987-6543 | +1 (555) 000-0002 |
+| Partner Billing | 1-800-555-0100 | +1 (800) 000-0003 |
 
 Each transfer shows a **different outbound number** to the person being called, even though agents are all in the same queue. This also works with **whitelisted numbers** — numbers that are not ported into the Amazon Connect account but have been approved by AWS for use as outbound caller IDs. Since the caller ID is set dynamically by the contact flow, any number whitelisted on the account can be used without needing to claim or port it into Connect.
 
