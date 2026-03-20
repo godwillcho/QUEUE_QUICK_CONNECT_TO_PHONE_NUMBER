@@ -167,6 +167,7 @@ Resources:
           import os
           import re
           import time
+          import urllib.parse
           from datetime import datetime, timezone
           from botocore.exceptions import ClientError
 
@@ -286,7 +287,7 @@ Resources:
 
                   for record in event.get('Records', []):
                       bucket = record['s3']['bucket']['name']
-                      key = record['s3']['object']['key']
+                      key = urllib.parse.unquote_plus(record['s3']['object']['key'])
 
                       # Build run folder name from timestamp + CSV filename
                       csv_filename = key.split('/')[-1].rsplit('.', 1)[0]
