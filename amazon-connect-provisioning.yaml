@@ -13,7 +13,6 @@ Metadata:
           - ConnectInstanceId
           - ConnectInstanceArn
           - HoursOfOperationId
-          - TransferContactFlowId
       - Label:
           default: "Environment Settings"
         Parameters:
@@ -27,18 +26,21 @@ Metadata:
 Parameters:
   ConnectInstanceId:
     Type: String
-    Description: Amazon Connect Instance ID
-    Default: '9b50ddcc-8510-441e-a9c8-96e9e9281105'
+    Description: Amazon Connect Instance ID (UUID format, e.g. aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)
+    AllowedPattern: '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
+    ConstraintDescription: Must be a valid UUID
 
   ConnectInstanceArn:
     Type: String
-    Description: Amazon Connect Instance ARN
-    Default: 'arn:aws:connect:us-east-1:551642657889:instance/9b50ddcc-8510-441e-a9c8-96e9e9281105'
+    Description: Amazon Connect Instance ARN (e.g. arn:aws:connect:REGION:ACCOUNT:instance/INSTANCE_ID)
+    AllowedPattern: 'arn:aws:connect:[a-z0-9-]+:[0-9]{12}:instance/[a-f0-9-]+'
+    ConstraintDescription: Must be a valid Amazon Connect instance ARN
 
   HoursOfOperationId:
     Type: String
-    Description: Hours of Operation ID for queue creation
-    Default: '0701af49-c81b-4516-ad6d-86940e98a66a'
+    Description: Hours of Operation ID for queue creation (UUID format)
+    AllowedPattern: '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
+    ConstraintDescription: Must be a valid UUID
 
   Environment:
     Type: String
