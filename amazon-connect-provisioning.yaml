@@ -840,7 +840,7 @@ Resources:
               }
             },
             {
-              "Parameters": {"ThirdPartyPhoneNumber": "$.External.PhoneNumberE164", "ThirdPartyConnectionTimeLimitSeconds": "30", "ContinueFlowExecution": "False"},
+              "Parameters": {"ThirdPartyPhoneNumber": "$.External.PhoneNumberE164", "ThirdPartyConnectionTimeLimitSeconds": "30", "ContinueFlowExecution": "False", "CallerId": {"Number": "$.External.CallerIdE164"}},
               "Identifier": "TransferToPhone",
               "Type": "TransferParticipantToThirdParty",
               "Transitions": {
