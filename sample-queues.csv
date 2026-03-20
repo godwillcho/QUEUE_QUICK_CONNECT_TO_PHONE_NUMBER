@@ -1,7 +1,7 @@
-QueueName,PhoneNumber,AssociateToQueue
-Sales,+1 (555) 123-4567,BasicQueue
-Support,(555) 987-6543,BasicQueue
-Billing,1-800-555-0100,BasicQueue
-Technical Support,5551234567,BasicQueue
-Customer Service,+44 20 7946 0958,BasicQueue
-Returns,555.321.9876,BasicQueue
+QueueName,TransferDestination,AssociateToQueue,CallerID,TransferFlowArn
+Sales,+1 (555) 123-4567,BasicQueue,+1 (555) 000-0001,
+Support,(555) 987-6543,BasicQueue,+1 (555) 000-0002,
+Billing,1-800-555-0100,BasicQueue,+1 (555) 000-0003,
+Technical Support,ExistingHelpDesk,BasicQueue,+1 (555) 000-0004,
+Customer Service,MainSupportQueue,BasicQueue,+44 20 7946 0958,arn:aws:connect:us-east-1:123456789012:instance/abc/contact-flow/def-456
+Returns,555.321.9876,BasicQueue,+1 (555) 000-0006,

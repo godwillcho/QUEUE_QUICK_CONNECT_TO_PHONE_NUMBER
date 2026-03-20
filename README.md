@@ -1,175 +1,143 @@
-# Amazon Connect Queue Provisioning System
+# Amazon Connect Queue & Quick Connect Provisioning System
 
-Automated provisioning of Amazon Connect queues and Quick Connects from CSV files using AWS CloudFormation.
+Automated provisioning of Amazon Connect queues and quick connects from CSV files using AWS CloudFormation. Supports transferring to external phone numbers or to other Connect queues.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              AWS Cloud                                       │
-│                                                                             │
-│  ┌──────────┐    ┌─────────────────────┐    ┌──────────────────────┐       │
-│  │  User    │    │      S3 Bucket      │    │  Provisioning Lambda │       │
-│  │ uploads  │───▶│  /uploads/*.csv     │───▶│                      │       │
-│  │  CSV     │    │                     │    │  1. Create Queues    │       │
-│  └──────────┘    └─────────────────────┘    │  2. Wait 5 seconds   │       │
-│                                             │  3. Create QCs       │       │
-│                                             │  4. Associate QCs    │       │
-│                                             └──────────┬───────────┘       │
-│                                                        │                    │
-│                         ┌──────────────────────────────┼───────────┐       │
-│                         │                              │           │       │
-│                         ▼                              ▼           ▼       │
-│                  ┌─────────────┐              ┌─────────────┐ ┌─────────┐  │
-│                  │  DynamoDB   │              │   Amazon    │ │ Amazon  │  │
-│                  │   Table     │              │  Connect    │ │ Connect │  │
-│                  │             │              │  Queues     │ │  Quick  │  │
-│                  │ - QueueName │              │             │ │Connects │  │
-│                  │ - QueueId   │              └─────────────┘ └─────────┘  │
-│                  │ - PhoneE164 │                                           │
-│                  │ - AssocQueue│                                           │
-│                  └──────┬──────┘                                           │
-│                         │                                                  │
-│                         ▼                                                  │
-│                  ┌─────────────┐         ┌─────────────────────┐          │
-│                  │   Query     │◀────────│   Amazon Connect    │          │
-│                  │   Lambda    │         │   Contact Flows     │          │
-│                  │             │         │                     │          │
-│                  └─────────────┘         └─────────────────────┘          │
-│                                                                            │
-└────────────────────────────────────────────────────────────────────────────┘
+CSV Upload to S3
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  Provisioning Lambda                                                 │
+│                                                                      │
+│  For each batch of 10 rows:                                          │
+│    1. Create queues in Amazon Connect                                │
+│    2. Wait for propagation                                           │
+│    3. Create queue quick connects                                    │
+│    4. Associate quick connects to target queues                      │
+│    5. Save metadata to DynamoDB                                      │
+│    6. Pause between batches (rate limiting)                          │
+│                                                                      │
+│  Write results:                                                      │
+│    results/{timestamp}_{csv-name}/success.csv                        │
+│    results/{timestamp}_{csv-name}/failure.csv                        │
+└──────────┬───────────────┬──────────────────┬────────────────────────┘
+           │               │                  │
+           ▼               ▼                  ▼
+    ┌────────────┐  ┌────────────┐   ┌──────────────────┐
+    │  DynamoDB   │  │  Connect   │   │  Connect Quick   │
+    │  Metadata   │  │  Queues    │   │  Connects        │
+    └──────┬─────┘  └────────────┘   └──────────────────┘
+           │
+           ▼
+    ┌────────────┐         ┌──────────────────────────┐
+    │  Query     │◀────────│  Queue Transfer Flow     │
+    │  Lambda    │         │                          │
+    │            │         │  PHONE → external call   │
+    └────────────┘         │  QUEUE → queue transfer  │
+                           └──────────────────────────┘
 ```
 
 ## What Gets Created
 
-The CloudFormation template creates all of these resources:
-
-| Resource | Name | Purpose |
-|----------|------|---------|
-| S3 Bucket | `connect-queue-provisioning-{account}-{env}` | CSV upload destination |
-| DynamoDB Table | `connect-queue-metadata-{env}` | Stores queue metadata |
-| Provisioning Lambda | `connect-queue-provisioning-{env}` | Creates queues & quick connects |
-| Query Lambda | `connect-queue-query-{env}` | Queries metadata from contact flows |
-| IAM Roles | Various | Permissions for Lambda functions |
-| CloudWatch Log Groups | `/aws/lambda/...` | Error logging only |
+| Resource | Name Pattern | Purpose |
+|----------|-------------|---------|
+| DynamoDB Table | `connect-queue-metadata-{env}-{deployId}` | Stores queue metadata |
+| Provisioning Lambda | `connect-queue-provisioning-{env}-{deployId}` | Creates queues & quick connects from CSV |
+| Query Lambda | `connect-queue-query-{env}-{deployId}` | Queries metadata (used by contact flows) |
+| S3 Bucket | `connect-queue-provisioning-{account}-{env}-{deployId}` | CSV upload + results |
+| Queue Transfer Flow | `Queue Transfer Flow - {env}-{deployId}` | Transfers calls based on TransferType |
+| IAM Roles | Auto-generated | Least-privilege permissions |
 
 ## Prerequisites
 
-Before deploying, you need:
-
 1. **Amazon Connect Instance** - Note the Instance ID and ARN
 2. **Hours of Operation** - Create one in Connect and note the ID
-3. **Contact Flow** - Create a transfer flow for Quick Connects and note the ID
-4. **AWS CLI** - Configured with appropriate permissions
+3. **AWS CLI** - Configured with appropriate permissions
 
 ### Finding Your IDs
 
-**Instance ID & ARN:**
 ```bash
-aws connect list-instances --query 'InstanceSummaryList[*].[Id,Arn,InstanceAlias]' --output table
-```
+# Instance ID & ARN
+aws connect list-instances \
+  --query 'InstanceSummaryList[*].[Id,Arn,InstanceAlias]' --output table
 
-**Hours of Operation ID:**
-```bash
-aws connect list-hours-of-operations --instance-id YOUR_INSTANCE_ID --query 'HoursOfOperationSummaryList[*].[Id,Name]' --output table
-```
-
-**Contact Flow ID:**
-```bash
-aws connect list-contact-flows --instance-id YOUR_INSTANCE_ID --query 'ContactFlowSummaryList[?Type==`QUEUE_TRANSFER`].[Id,Name]' --output table
+# Hours of Operation ID
+aws connect list-hours-of-operations \
+  --instance-id YOUR_INSTANCE_ID \
+  --query 'HoursOfOperationSummaryList[*].[Id,Name]' --output table
 ```
 
 ## Deployment
 
-### Step 1: Deploy the CloudFormation Stack
-
 ```bash
 aws cloudformation deploy \
   --template-file amazon-connect-provisioning.yaml \
-  --stack-name connect-queue-provisioning \
+  --stack-name QuickConnect-Queue-to-PhoneNumber-Matching-dev \
   --parameter-overrides \
-    ConnectInstanceId=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee \
-    ConnectInstanceArn=arn:aws:connect:us-east-1:123456789012:instance/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee \
-    HoursOfOperationId=11111111-2222-3333-4444-555555555555 \
-    TransferContactFlowId=66666666-7777-8888-9999-000000000000 \
+    ConnectInstanceId=YOUR_INSTANCE_ID \
+    ConnectInstanceArn=YOUR_INSTANCE_ARN \
+    HoursOfOperationId=YOUR_HOURS_ID \
     Environment=dev \
-  --capabilities CAPABILITY_NAMED_IAM
+    DeployId=v1 \
+  --capabilities CAPABILITY_IAM
 ```
 
-### Step 2: Get the S3 Bucket Name
+### Parameters
 
-```bash
-aws cloudformation describe-stacks \
-  --stack-name connect-queue-provisioning \
-  --query 'Stacks[0].Outputs[?OutputKey==`S3BucketName`].OutputValue' \
-  --output text
-```
-
-### Step 3: Upload Your CSV File
-
-```bash
-aws s3 cp queues.csv s3://connect-queue-provisioning-123456789012-dev/uploads/
-```
-
-**Important:** Files must be uploaded to the `uploads/` folder and have `.csv` extension.
-
-## Processing Flow
-
-When you upload a CSV, the following happens automatically:
-
-```
-1. S3 detects new .csv file in uploads/
-           │
-           ▼
-2. Triggers Provisioning Lambda
-           │
-           ▼
-3. Lambda loads existing queues from Connect
-           │
-           ▼
-4. PHASE 1: Creates ALL queues from CSV
-           │
-           ▼
-5. Waits 5 seconds (propagation delay)
-           │
-           ▼
-6. Reloads queue mapping
-           │
-           ▼
-7. PHASE 2: Creates Quick Connects (same name as queue)
-           │
-           ▼
-8. Associates Quick Connects to target queues
-           │
-           ▼
-9. Stores metadata in DynamoDB
-```
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `ConnectInstanceId` | Connect instance UUID | - |
+| `ConnectInstanceArn` | Connect instance full ARN | - |
+| `HoursOfOperationId` | Hours of operation UUID | - |
+| `Environment` | `dev`, `staging`, or `prod` | `dev` |
+| `DeployId` | Unique deployment identifier (max 10 chars) | `v1` |
+| `LogRetentionDays` | CloudWatch log retention | `30` |
 
 ## CSV File Format
 
-The CSV file must contain the following columns:
+Upload CSV files to the `uploads/` folder in the S3 bucket:
+
+```bash
+aws s3 cp queues.csv s3://connect-queue-provisioning-{account}-{env}-{deployId}/uploads/
+```
+
+### Columns
 
 | Column | Required | Description |
 |--------|----------|-------------|
-| `QueueName` | Yes | Name for the Amazon Connect queue (also used as Quick Connect name) |
-| `PhoneNumber` | Yes | Phone number (any format, converted to E.164) |
-| `AssociateToQueue` | Yes | Name of the queue to associate the Quick Connect with |
+| `QueueName` | Yes | Name for the queue and quick connect |
+| `TransferDestination` | Yes | Phone number OR existing queue name |
+| `AssociateToQueue` | No | Queue to associate the quick connect with |
+| `CallerID` | No | Caller ID phone number (normalized to E.164) |
+| `TransferFlowArn` | No | Custom transfer flow ARN (QUEUE type only, overrides default) |
 
-### How It Works
+### Transfer Types
 
-For each row, the system:
-1. Creates a **Queue** with the name from `QueueName`
-2. Creates a **Quick Connect** with the **same name** as the queue
-3. Associates the Quick Connect with the queue specified in `AssociateToQueue`
+The system automatically detects whether `TransferDestination` is a phone number or a queue name:
 
-This allows agents in one queue to see Quick Connects for transferring to other queues.
+| TransferDestination | Detected As | Behavior |
+|---------------------|-------------|----------|
+| `+1 (555) 123-4567` | `PHONE` | Quick connect transfers call to external phone number |
+| `BasicQueue` | `QUEUE` | Quick connect transfers call to the specified queue |
 
-### Supported Phone Number Formats
+### Sample CSV
 
-The system automatically converts phone numbers to E.164 format:
+```csv
+QueueName,TransferDestination,AssociateToQueue,CallerID,TransferFlowArn
+Sales,+1 (555) 123-4567,BasicQueue,+1 (555) 000-0001,
+Support,(555) 987-6543,BasicQueue,+1 (555) 000-0002,
+Billing,1-800-555-0100,BasicQueue,+1 (555) 000-0003,
+Technical Support,ExistingHelpDesk,BasicQueue,+1 (555) 000-0004,
+Customer Service,MainSupportQueue,BasicQueue,+44 20 7946 0958,arn:aws:connect:us-east-1:123456789012:instance/abc/contact-flow/def-456
+Returns,555.321.9876,BasicQueue,+1 (555) 000-0006,
+```
 
-| Input Format | Output (E.164) |
-|--------------|----------------|
+### Phone Number Normalization
+
+| Input | Output (E.164) |
+|-------|----------------|
 | `+1 (555) 123-4567` | `+15551234567` |
 | `(555) 987-6543` | `+15559876543` |
 | `1-800-555-0100` | `+18005550100` |
@@ -177,156 +145,149 @@ The system automatically converts phone numbers to E.164 format:
 | `+44 20 7946 0958` | `+442079460958` |
 | `555.321.9876` | `+15553219876` |
 
-### Sample CSV
+## Processing Flow
 
-```csv
-QueueName,PhoneNumber,AssociateToQueue
-Sales,(555) 123-4567,Main
-Support,1-800-555-0199,Main
-Billing,(555) 444-5555,Support
+```
+Upload CSV to s3://bucket/uploads/
+        │
+        ▼
+Parse all rows, detect TransferType (PHONE or QUEUE)
+        │
+        ▼
+┌─── Batch 1 (rows 1-10) ──────────────────────────────┐
+│  Create 10 queues (0.5s delay between each)           │
+│  Wait 5s for propagation                              │
+│  Create 10 quick connects + associate (0.5s delay)    │
+│  Save to DynamoDB                                     │
+└───────────────────────────────────────────────────────┘
+        │ 3s batch delay
+        ▼
+┌─── Batch 2 (rows 11-20) ─────────────────────────────┐
+│  ... same process ...                                 │
+└───────────────────────────────────────────────────────┘
+        │
+        ▼
+Write results to S3:
+  results/{timestamp}_{csv-name}/success.csv
+  results/{timestamp}_{csv-name}/failure.csv
 ```
 
-In this example:
-- `Sales` queue is created, Quick Connect `Sales` is added to `Main` queue
-- `Support` queue is created, Quick Connect `Support` is added to `Main` queue  
-- `Billing` queue is created, Quick Connect `Billing` is added to `Support` queue
+## Result Files
 
-Agents in the `Main` queue will see `Sales` and `Support` as transfer options.
+After each run, two CSV files are written to the S3 bucket:
 
-## Using the Query Lambda
+### success.csv
 
-The Query Lambda can be invoked from Amazon Connect contact flows or directly.
+Contains all successfully provisioned rows with their DynamoDB attributes:
 
-### Operations
-
-#### 1. Get Queue by Name
-
-```json
-{
-  "operation": "get_queue",
-  "queue_name": "Sales"
-}
+```
+QueueName,TransferType,TransferDestination,QueueArn,QuickConnectName,
+PhoneNumberE164,TargetQueueArn,CallerIdE164,AssociatedQueueName,
+TransferFlowArn,CreatedAt
 ```
 
-**Response:**
-```json
-{
-  "QueueName": "Sales",
-  "QueueId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-  "QuickConnectName": "Sales",
-  "QuickConnectId": "11111111-2222-3333-4444-555555555555",
-  "PhoneNumber": "+15551234567",
-  "AssociatedQueueName": "Main",
-  "Found": "true"
-}
+### failure.csv
+
+Contains rows that failed with the original CSV data plus error details:
+
 ```
-
-All values are at the top level for easy access in Connect contact flows via `$.External.QueueName`, `$.External.PhoneNumber`, etc.
-
-#### 2. List All Queues
-
-```json
-{
-  "operation": "list_queues",
-  "limit": 50
-}
+QueueName,TransferDestination,AssociateToQueue,CallerID,TransferFlowArn,Error
+TestFailQueue,NonExistentQueue,BasicQueue,+1 (555) 000-0003,,Destination queue not found: NonExistentQueue
 ```
-
-#### 3. Search by Phone Number
-
-```json
-{
-  "operation": "search_by_phone",
-  "phone_number": "+15551234567"
-}
-```
-
-### Amazon Connect Contact Flow Integration
-
-In your contact flow, use the **Invoke AWS Lambda function** block:
-
-1. Select the `connect-queue-query-{environment}` function
-2. Add function input parameters:
-   - `Operation`: `get_queue`
-   - `QueueName`: Use a contact attribute or static value
-
-3. Access returned attributes:
-   - `$.External.QueueId`
-   - `$.External.PhoneNumber`
-   - `$.External.Found`
 
 ## DynamoDB Table Schema
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `QueueName` | String | Partition key |
-| `QueueId` | String | Amazon Connect queue ID |
-| `QuickConnectName` | String | Quick Connect name (same as QueueName) |
-| `QuickConnectId` | String | Quick Connect ID |
-| `PhoneNumberE164` | String | Phone number in E.164 format |
-| `AssociatedQueueName` | String | Name of queue the Quick Connect is associated with |
+| `QueueArn` | String | Full queue ARN |
+| `TransferType` | String | `PHONE` or `QUEUE` |
+| `TransferDestination` | String | Original value from CSV |
+| `QuickConnectName` | String | Quick connect name (same as QueueName) |
+| `QuickConnectId` | String | Quick connect ID |
+| `PhoneNumberE164` | String | E.164 phone number (PHONE type only) |
+| `TargetQueueArn` | String | Destination queue ARN (QUEUE type only) |
+| `CallerIdE164` | String | Caller ID in E.164 format |
+| `AssociatedQueueName` | String | Queue the quick connect is associated with |
+| `TransferFlowArn` | String | Custom flow ARN (if specified) |
 | `CreatedAt` | String | ISO 8601 timestamp |
-| `UpdatedAt` | String | ISO 8601 timestamp |
 
-**Note:** Only `AssociatedQueueName` is stored. The Queue ID is resolved at runtime by fetching all queues and mapping names to IDs.
+## Query Lambda
 
-## Monitoring
+The Query Lambda is used by contact flows and can be invoked directly. It returns **all** DynamoDB attributes for each record.
 
-### CloudWatch Logs
+### Operations
 
-- Provisioning Lambda: `/aws/lambda/connect-queue-provisioning-{env}`
-- Query Lambda: `/aws/lambda/connect-queue-query-{env}`
+#### Get Queue by Name
 
-### CloudWatch Metrics
+```json
+{"operation": "get_queue", "QueueName": "Sales"}
+```
 
-Monitor the following metrics:
-- `AWS/Lambda/Invocations`
-- `AWS/Lambda/Errors`
-- `AWS/Lambda/Duration`
-- `AWS/DynamoDB/ConsumedReadCapacityUnits`
-- `AWS/DynamoDB/ConsumedWriteCapacityUnits`
+Response includes all attributes from the table plus `"Found": "true"`.
 
-## Security
+#### List All Queues
 
-The template implements the following security measures:
+```json
+{"operation": "list_queues", "limit": 50}
+```
 
-- **S3 Bucket**: Encryption at rest, public access blocked, versioning enabled
-- **DynamoDB**: Encryption at rest, point-in-time recovery enabled
-- **IAM**: Least-privilege policies for Lambda functions
-- **Lambda**: Functions have only required permissions
+#### Search by Phone Number
+
+```json
+{"operation": "search_by_phone", "PhoneNumber": "+15551234567"}
+```
+
+### Contact Flow Integration
+
+The deployed Queue Transfer Flow automatically:
+
+1. Invokes the Query Lambda with the queue name
+2. Checks if a record was found
+3. Checks `TransferType`:
+   - **PHONE** - Transfers the call to the external phone number (`PhoneNumberE164`)
+   - **QUEUE** - Ends the flow, allowing the quick connect's queue config to transfer to the target queue
+
+## Utilities
+
+### update_dynamodb_pk.py
+
+Standalone script to update DynamoDB partition keys from a CSV file. Useful for migrating or correcting `PhoneNumberE164` values. See `sample-queue-phones.csv` for the expected format.
 
 ## Cleanup
 
-To delete all resources, simply delete the stack:
-
+1. Empty the S3 bucket:
 ```bash
-aws cloudformation delete-stack --stack-name connect-queue-provisioning
+aws s3 rm s3://connect-queue-provisioning-{account}-{env}-{deployId} --recursive
 ```
 
-**Note:** The S3 bucket is automatically emptied before deletion. No manual cleanup required.
+2. Delete quick connects and queues created by the system (CloudFormation cannot delete these automatically):
+```bash
+# List and delete quick connects
+aws connect list-quick-connects --instance-id YOUR_INSTANCE_ID --quick-connect-types QUEUE
 
-The stack includes a cleanup Lambda that:
-- Deletes all objects in the bucket
-- Deletes all object versions (since versioning is enabled)
-- Runs automatically when the stack is deleted
+# List and delete queues
+aws connect list-queues --instance-id YOUR_INSTANCE_ID --queue-types STANDARD
+```
+
+3. Delete the stack:
+```bash
+aws cloudformation delete-stack --stack-name QuickConnect-Queue-to-PhoneNumber-Matching-dev
+```
 
 ## Troubleshooting
 
-### Common Issues
-
 | Issue | Solution |
 |-------|----------|
-| Lambda timeout | Increase `Timeout` in CloudFormation template |
-| Permission denied | Verify IAM policies include required Connect permissions |
-| Queue already exists | System handles duplicates gracefully, logs warning |
-| Invalid phone number | Check CloudWatch logs for formatting warnings |
+| `ResourceNotFoundException` on ListQueues | Verify `ConnectInstanceId` is correct and matches the deployment region |
+| `InvalidParameterException` on ListQueues | Use the instance UUID only, not the full ARN |
+| `ServiceLimitExceeded` on contact flow | Delete unused contact flows in the Connect instance |
+| `CREATE_FAILED` on IAM role | Role name already exists from a previous deployment; stack uses auto-generated names to avoid this |
+| Lambda timeout | Lambda is set to 15 minutes (max); reduce batch size or increase delays if hitting API throttling |
+| Quick connects not visible to agents | Ensure `AssociateToQueue` matches an existing queue name exactly |
 
 ### Viewing Logs
 
 ```bash
-aws logs tail /aws/lambda/connect-queue-provisioning-dev --follow
+aws logs tail /aws/lambda/connect-queue-provisioning-{env}-{deployId} --follow
 ```
-
-## License
-
-MIT License - See LICENSE file for details.
