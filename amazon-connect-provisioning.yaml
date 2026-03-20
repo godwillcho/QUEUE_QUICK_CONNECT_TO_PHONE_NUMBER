@@ -453,14 +453,18 @@ Resources:
               return qcs
 
 
-          def get_qc_flow_id(qc_id):
+          def get_qc_config(qc_id):
               try:
                   resp = connect.describe_quick_connect(
                       InstanceId=CONNECT_INSTANCE_ID,
                       QuickConnectId=qc_id
                   )
                   config = resp['QuickConnect']['QuickConnectConfig']
-                  return config.get('QueueConfig', {}).get('ContactFlowId')
+                  queue_config = config.get('QueueConfig', {})
+                  return {
+                      'flow_id': queue_config.get('ContactFlowId'),
+                      'queue_id': queue_config.get('QueueId')
+                  }
               except ClientError as e:
                   logger.error(f"Describe QC error: {e}")
               return None
@@ -490,10 +494,10 @@ Resources:
           def create_quick_connect(name, queue_id, flow_id, existing_qcs, assoc_queue_name='', existing_queues=None):
               if name in existing_qcs:
                   existing_qc_id = existing_qcs[name]
-                  current_flow_id = get_qc_flow_id(existing_qc_id)
-                  if current_flow_id == flow_id:
+                  current = get_qc_config(existing_qc_id)
+                  if current and current['flow_id'] == flow_id and current['queue_id'] == queue_id:
                       return existing_qc_id
-                  # Flow changed — delete and recreate
+                  # Config changed — delete and recreate
                   delete_quick_connect(existing_qc_id, assoc_queue_name, existing_queues or {})
                   del existing_qcs[name]
                   time.sleep(API_DELAY)
