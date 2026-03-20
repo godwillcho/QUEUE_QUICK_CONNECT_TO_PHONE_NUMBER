@@ -107,6 +107,10 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::connect-queue-provisioning-${AWS::AccountId}-${Environment}-${DeployId}'
+              - Effect: Allow
+                Action:
                   - s3:GetObject
                   - s3:PutObject
                 Resource: !Sub 'arn:aws:s3:::connect-queue-provisioning-${AWS::AccountId}-${Environment}-${DeployId}/*'
